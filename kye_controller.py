@@ -1,179 +1,196 @@
+"""
+A merged POX controller that does:
+1) L2 Learning (so normal traffic is forwarded).
+2) TRW-CB style scanning detection (KYE Attack logic).
+"""
+
 from pox.core import core
 import pox.openflow.libopenflow_01 as of
+from pox.lib.packet import ethernet, ipv4, tcp, udp, icmp
 from collections import defaultdict
 import time
 
-from pox.lib.packet import ipv4, icmp, tcp, udp, ethernet
-from pox.lib.packet.icmpv6 import icmpv6
-
 log = core.getLogger()
 
-# TRW-CB / credit-based approach constants
+# L2 Learning optional hold-down time
+FLOOD_DELAY = 0
+
+# TRW-CB style scanning detection parameters
 BASE_CREDITS = 10
-SUCCESS_INC = 2      # how many credits to add on a successful connection
-FAIL_DEC = 1         # how many credits to remove on a failed connection
-FAIL_RATIO_THRESHOLD = 0.55  # alternative detection condition
+SUCCESS_INC = 2
+FAIL_DEC    = 1
+FAIL_RATIO_THRESHOLD = 0.55
+SCAN_WINDOW = 30  # seconds, after which we reset stats if no new traffic
 
-IDLE_TIMEOUT = 60
-HARD_TIMEOUT = 300
+IDLE_TIMEOUT = 30
+HARD_TIMEOUT = 60
 
-class KYEController(object):
-    """
-    A simplified POX controller using a credit-based approach to detect scanning
-    (inspired by TRW-CB). If a host's IP is flagged as scanning, we push a DROP rule.
-    """
-    def __init__(self, connection):
+class MergeKYEL2Switch(object):
+    def __init__(self, connection, transparent=False):
         self.connection = connection
-        # For L2 learning or storing MAC→port
-        self.mac_to_port = {}
+        self.transparent = transparent
 
-        # ip_state[src_ip] = {
-        #   "credits": ...,
-        #   "success": ...,
-        #   "fail": ...,
-        #   "last_time": ...
-        # }
-        self.ip_state = defaultdict(lambda: {
-            "credits": BASE_CREDITS, 
-            "success": 0,
-            "fail": 0,
-            "last_time": time.time()
+        # For L2 learning:
+        # {mac_addr : port_no}
+        self.mac_table = {}
+
+        # For scanning detection:
+        # ip_stats[src_ip] = { 'credits', 'fail', 'success', 'last_time'}
+        self.ip_stats = defaultdict(lambda: {
+            'credits': BASE_CREDITS,
+            'fail': 0,
+            'success': 0,
+            'last_time': time.time(),
         })
 
-        # Time window for resetting scanning stats (secs)
-        self.scan_window = 20
-
-        # Bind listeners
         connection.addListeners(self)
+        log.info(">>> Merge KYE-L2 Controller for %s", connection)
 
     def _handle_PacketIn(self, event):
         packet = event.parsed
-        in_port = event.port
+        inport = event.port
 
         if not packet:
             return
 
-        # Basic L2 learning
-        src_mac = packet.src
-        dst_mac = packet.dst
-
-        self.mac_to_port[src_mac] = in_port
-
-        # If ARP, just flood or handle normally
-        if packet.type == packet.ARP_TYPE:
-            self._flood_packet(event, packet)
+        if packet.type == ethernet.LLDP_TYPE:
+            # Typically drop LLDP
             return
 
-        # We handle IPv4 specifically
+        # L2 learning: record that packet.src came in on inport
+        self.mac_table[packet.src] = inport
+
+        # Now let's do the typical "if we know where packet.dst is, forward, else flood."
+        dst_port = self.mac_table.get(packet.dst)
+
+        # Possibly we skip some special cases for broadcast, etc.
+        # If it's broadcast or multicast, we flood.
+        if packet.dst.is_multicast:
+            self._flood_packet(event)
+            return
+
+        # If we do not know the port for that MAC yet, we might flood.
+        if dst_port is None:
+            self._flood_packet(event)
+        else:
+            if dst_port == inport:
+                # It's coming from the same port, drop to avoid loops
+                self._drop_packet(event, duration=2)
+                return
+            else:
+                # We have a known port. We can install a flow from inport->dst_port
+                self._install_l2_flow(event, packet, out_port=dst_port)
+
+        # Next, do scanning detection if it's IPv4
         ip_pkt = packet.find('ipv4')
         if ip_pkt:
-            src_ip = ip_pkt.srcip
-            dst_ip = ip_pkt.dstip
+            src_ip = str(ip_pkt.srcip)
+            now = time.time()
 
-            proto = ip_pkt.protocol
-            # Could refine by reading 'tcp', 'udp' port
-            transport = packet.find('tcp') or packet.find('udp') or packet.find('icmp') or packet.find('icmpv6')
-            
-            if transport:
-                # Distinguish success vs. fail: 
-                # "Fail" = If we suspect that DST is unresponsive? 
-                # In practice, we'd do more logic. For demo, let's treat unknown host as "fail"
-                # or we can keep it simpler: each new flow => check if reached some open port 
-                # For a full approach, you'd parse RST or TTL. We'll do a simplified approach:
+            # If too long since last traffic, reset
+            if now - self.ip_stats[src_ip]['last_time'] > SCAN_WINDOW:
+                self.ip_stats[src_ip]['credits'] = BASE_CREDITS
+                self.ip_stats[src_ip]['fail'] = 0
+                self.ip_stats[src_ip]['success'] = 0
 
-                # 1) We update time
-                st = self.ip_state[str(src_ip)]
-                now = time.time()
-                # If time elapsed > scan_window, reset
-                if (now - st["last_time"]) > self.scan_window:
-                    st["credits"] = BASE_CREDITS
-                    st["success"] = 0
-                    st["fail"] = 0
-                st["last_time"] = now
+            self.ip_stats[src_ip]['last_time'] = now
 
-                # We'll do a simple "if port < 1024 => success, else => fail" for demonstration
-                # or we can do "if the DST MAC is known => success, else => fail".
-                # For a more realistic approach, you'd watch for actual handshake or replies.
-                
-                # We'll do a naive approach: if we do not know MAC of dst => fail
-                if dst_mac not in self.mac_to_port.values():
-                    # treat as fail
-                    st["fail"] += 1
-                    st["credits"] -= FAIL_DEC
-                    log.debug(f"[{src_ip}] scanning fail => credits={st['credits']}, fail={st['fail']}")
+            # Let's check if the transport is e.g. TCP, UDP, or ICMP
+            t = packet.find('tcp') or packet.find('udp') or packet.find('icmp')
+            if t:
+                # We'll define a naive success/fail:
+                # If we have a known MAC for the dst => success
+                # (meaning we "believe" the host is valid).
+                # If we didn't know the MAC => fail
+                # BUT we already installed it above if mac was unknown => flood
+                # Actually let's do a minimal approach:
+                if dst_port is None:
+                    # We *just* flooded => let's skip marking that fail
+                    pass
                 else:
-                    # treat as success
-                    st["success"] += 1
-                    st["credits"] += SUCCESS_INC
-                    log.debug(f"[{src_ip}] scanning success => credits={st['credits']}, success={st['success']}")
+                    # We know the mac, let's call it success
+                    self.ip_stats[src_ip]['success'] += 1
+                    self.ip_stats[src_ip]['credits'] += SUCCESS_INC
 
-                # Check ratio or credit
+                # Alternatively, if we want to handle a “port not found” or “port mismatch,” that might be fail
+                # But for now let's keep it simpler
+
+                # Check ratio
+                s = self.ip_stats[src_ip]['success']
+                f = self.ip_stats[src_ip]['fail']
+                total = s + f
                 fail_ratio = 0.0
-                total_conn = st["fail"] + st["success"]
-                if total_conn > 0:
-                    fail_ratio = float(st["fail"])/float(total_conn)
+                if total > 0:
+                    fail_ratio = float(f)/float(total)
 
-                # Condition #1: credit <= 0 => block
-                # Condition #2: fail_ratio > 0.55 => block
-                if st["credits"] <= 0 or fail_ratio >= FAIL_RATIO_THRESHOLD:
-                    log.info(f"KYE Attack DETECT: {src_ip} BLOCKED (credits={st['credits']}, fail_ratio={fail_ratio:.2f})")
-                    self.block_ip(src_ip, event, packet)
+                # Also check if credits <= 0 or fail_ratio >= 0.55
+                credits_now = self.ip_stats[src_ip]['credits']
+                if credits_now <= 0 or fail_ratio >= FAIL_RATIO_THRESHOLD:
+                    log.info("DETECT SCANNING - BLOCK src=%s (credits=%.1f fail_ratio=%.2f)", 
+                             src_ip, credits_now, fail_ratio)
+                    self._block_src_ip(src_ip)
                     return
 
-            # If not blocked, forward or flood
-            self._install_flow(event, packet)
-            return
+    def _flood_packet(self, event):
+        """ Flood the packet out all ports except the one it came in on. """
+        msg = of.ofp_packet_out()
+        msg.data = event.ofp
+        msg.in_port = event.port
+        msg.actions.append(of.ofp_action_output(port=of.OFPP_FLOOD))
+        self.connection.send(msg)
 
+    def _drop_packet(self, event, duration=2):
+        """ Drop this packet, optionally installing a short flow entry. """
+        if duration:
+            fm = of.ofp_flow_mod()
+            fm.match = of.ofp_match.from_packet(event.parsed, event.port)
+            fm.idle_timeout = duration
+            fm.hard_timeout = duration
+            fm.priority = 10
+            self.connection.send(fm)
         else:
-            # If non-IPv4, just do normal L2 flooding or bridging
-            self._flood_packet(event, packet)
+            # Just packet out with no actions
+            msg = of.ofp_packet_out()
+            msg.data = event.ofp
+            self.connection.send(msg)
 
-    def _install_flow(self, event, packet):
-        """
-        Install a simple forward-flow (like L2 learn).
-        """
+    def _install_l2_flow(self, event, packet, out_port):
+        """ Install a unidirectional L2 flow from (inport, src->dst) to out_port. """
         msg = of.ofp_flow_mod()
         msg.match = of.ofp_match.from_packet(packet, event.port)
         msg.idle_timeout = IDLE_TIMEOUT
         msg.hard_timeout = HARD_TIMEOUT
-        # For demonstration, just flood out
-        msg.actions.append(of.ofp_action_output(port = of.OFPP_FLOOD))
+        msg.priority = 10
+        msg.actions.append(of.ofp_action_output(port=out_port))
+        msg.data = event.ofp  # so we forward this packet too
         self.connection.send(msg)
 
-        # Also do packet-out
-        po = of.ofp_packet_out()
-        po.data = event.ofp
-        po.actions.append(of.ofp_action_output(port = of.OFPP_FLOOD))
-        self.connection.send(po)
-
-    def _flood_packet(self, event, packet):
-        msg = of.ofp_packet_out()
-        msg.data = event.ofp
-        msg.actions.append(of.ofp_action_output(port=of.OFPP_FLOOD))
-        self.connection.send(msg)
-
-    def block_ip(self, src_ip, event, packet):
-        """
-        Insert a DROP rule for src_ip
-        """
-        # match: ip src = src_ip
+    def _block_src_ip(self, src_ip):
+        """ Insert a high-priority DROP rule for all traffic from src_ip. """
         fm = of.ofp_flow_mod()
         fm.match.dl_type = 0x0800  # IPv4
         fm.match.nw_src = src_ip
+        fm.priority = 100
         # no actions => drop
-        fm.idle_timeout = IDLE_TIMEOUT
-        fm.hard_timeout = HARD_TIMEOUT
-        fm.priority = 100  # higher than normal
+        fm.idle_timeout = 120
+        fm.hard_timeout = 300
         self.connection.send(fm)
+        log.info("  => Pushed DROP rule for %s", src_ip)
 
-        # Also do a packet_out to drop the current packet
-        # i.e. no actions
-        pass
 
-def launch():
+def launch(transparent=False, hold_down=None):
+    """
+    POX "launch" function
+    usage: ./pox.py log.level --DEBUG kye_merge_controller [--transparent=False] [--hold_down=0]
+    """
+    global FLOOD_DELAY
+    if hold_down is not None:
+        FLOOD_DELAY = int(hold_down)
+
+    transparent = str(transparent).lower() == 'true'
+
     def start_switch(event):
-        log.info(f"KYEController Start on {event.connection.dpid}")
-        KYEController(event.connection)
+        log.info("** Merged KYE-L2Switch on %s", event.connection)
+        MergeKYEL2Switch(event.connection, transparent=transparent)
 
     core.openflow.addListenerByName("ConnectionUp", start_switch)
-
