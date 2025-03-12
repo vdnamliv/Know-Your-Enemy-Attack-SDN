@@ -13,3 +13,7 @@ Implement KYE attack (Side Channel Attack) in SDN environment, and using Flow Ob
 ```
 sudo mn --custom topology.py --topo simplesdntopo --controller remote
 ```
+- Dump flow:
+```
+sudo ovs-ofctl dump-flows s1
+```
