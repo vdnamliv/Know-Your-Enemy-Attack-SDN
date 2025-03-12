@@ -11,5 +11,5 @@ Implement KYE attack (Side Channel Attack) in SDN environment, and using Flow Ob
 ```
 - Run topology in mininet:
 ```
-sudo mn --custom topo_1.py --topo simplesdntopo --controller remote
+sudo mn --custom topology.py --topo simplesdntopo --controller remote
 ```
