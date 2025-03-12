@@ -7,7 +7,7 @@ Implement KYE attack (Side Channel Attack) in SDN environment, and using Flow Ob
 ## Implement
 - Run controller:
 ```
-./pox.py log.level --DEBUG samples.pretty_log forwarding.l2_learning kye_controller 
+./pox.py log.level --DEBUG kye_controller 
 ```
 - Run topology in mininet:
 ```
