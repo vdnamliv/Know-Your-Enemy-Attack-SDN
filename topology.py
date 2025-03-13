@@ -1,29 +1,29 @@
 from mininet.topo import Topo
 
-class SimpleSDNTopo(Topo):
+class LargeSDNTopo(Topo):
     def build(self):
         # 3 Switches
         s1 = self.addSwitch('s1')
         s2 = self.addSwitch('s2')
         s3 = self.addSwitch('s3')
 
-        # 6 Hosts
-        h1 = self.addHost('h1', ip='10.0.0.1/24', defaultRoute='via 10.0.0.254')
-        h2 = self.addHost('h2', ip='10.0.0.2/24', defaultRoute='via 10.0.0.254')
-        h3 = self.addHost('h3', ip='10.0.0.3/24', defaultRoute='via 10.0.0.254')
-        h4 = self.addHost('h4', ip='10.0.0.4/24', defaultRoute='via 10.0.0.254')
-        h5 = self.addHost('h5', ip='10.0.0.5/24', defaultRoute='via 10.0.0.254')
-        h6 = self.addHost('h6', ip='10.0.0.6/24', defaultRoute='via 10.0.0.254')
+        # 30 Hosts
+        hosts = []
+        for i in range(1, 31):
+            ip = f"10.0.0.{i}/24"
+            host = self.addHost(f'h{i}', ip=ip)
+            hosts.append(host)
 
-        # Links
+        # Links between switches
         self.addLink(s1, s2)
         self.addLink(s2, s3)
 
-        self.addLink(h1, s1)
-        self.addLink(h2, s1)
-        self.addLink(h3, s2)
-        self.addLink(h4, s2)
-        self.addLink(h5, s3)
-        self.addLink(h6, s3)
+        # Assign hosts to switches (dividing equally)
+        for i in range(10):
+            self.addLink(hosts[i], s1)   # h1-h10 → s1
+        for i in range(10, 20):
+            self.addLink(hosts[i], s2)   # h11-h20 → s2
+        for i in range(20, 30):
+            self.addLink(hosts[i], s3)   # h21-h30 → s3
 
-topos = {'simplesdntopo': (lambda: SimpleSDNTopo())}
+topos = {'largesdntopo': (lambda: LargeSDNTopo())}
