@@ -25,15 +25,19 @@ sudo apt install mininet -y
 ## Implement
 - Run controller:
 ```
-./pox.py log.level --DEBUG kye_controller 
+python pox.py log.level --DEBUG kye_controller 
 ```
 - Run topology in mininet:
 ```
-sudo mn --custom topology.py --topo largesdntopo --controller remote
+sudo mn --custom router_topo.py --topo threesubnet --controller remote --switch ovsk
 ```
 - Dump flow:
 ```
 sudo ovs-ofctl dump-flows s1
+```
+or using flow_monitor.py for easier viewing (You can use this outside of venv, using python3):
+```
+sudo python3 flow_monitor.py
 ```
 -Del flow:
 ```
