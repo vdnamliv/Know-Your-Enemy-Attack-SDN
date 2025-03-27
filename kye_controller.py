@@ -1,14 +1,22 @@
 #!/usr/bin/env python2
 # -*- coding: utf-8 -*-
+
 """
-POX Controller:
-1) L2 Learning switch (ARP, ICMP, v.v.).
-2) TRW-CB scanning detection:
-   - Nếu nhận được TCP SYN từ cổng FAKE_OPEN_PORTS (ví dụ: 80, 443, 8080) => tính là success.
-   - Nếu nhận được TCP SYN từ cổng khác, hoặc nhận gói TCP RST => tính là fail.
-   - Mỗi success tăng SUCCESS_INC credits, mỗi fail giảm FAIL_DEC credits.
-   - Nếu tỉ lệ thất bại >= 0.55 hoặc credits <= 0, host sẽ bị block (cài drop flow).
-No timer cho "no response" => ta tự quyết định cổng đóng = fail ngay.
+POX Controller: TRW-CB using real port 80 on h2.
+ - When a TCP SYN is sent (from client to server): if there is available credit,
+   then forward the SYN, increment pending counter and decrement credit.
+ - When the server returns a SYN+ACK: treat it as success → decrement pending,
+   increment success, and add SUCCESS_INC to credit.
+ - When an RST is received or if no response is received after a timeout,
+   treat it as a failure → decrement pending and decrement credit by FAIL_DEC.
+ - The controller does not permanently block the host.
+ - No L2 flow is installed for TCP so that all TCP packets (both outbound and inbound)
+   generate PacketIn events for TRW-CB processing.
+
+Edited to fix inbound RST logic for hping3:
+ - If inbound RST is actually from local client (srcip in local subnet),
+   do not count as fail or subtract credit.
+ - Only treat inbound RST from a remote (outside 10.0.0.0/24) as fail.
 """
 
 from pox.core import core
@@ -19,47 +27,33 @@ from collections import defaultdict
 
 log = core.getLogger()
 
-# -------------------- TRW-CB Parameters --------------------
-BASE_CREDITS = 10       # Initial credits for each host
-SUCCESS_INC  = 2        # Increase credits on success
-FAIL_DEC     = 1        # Decrease credits on fail
-FAIL_RATIO_THRESHOLD = 0.55  # If fail ratio >= 0.55, host is considered scanning
+# ---------- TRW-CB Parameters ----------
+BASE_CREDITS     = 10    # initial credits per host
+SUCCESS_INC      = 2     # credits gained on success
+FAIL_DEC         = 1     # credits lost on failure
+PENDING_TIMEOUT  = 1.0   # seconds to wait for a response before marking as fail
 
-# Fake open ports – chỉ giả lập rằng các cổng này mở
-FAKE_OPEN_PORTS = [80, 443, 8080]
-
-# Flow timeouts
+# Flow timeouts for non-TCP flows (ARP/ICMP)
 IDLE_TIMEOUT = 30
 HARD_TIMEOUT = 60
 
-# MAC learning timeout (nếu cần)
-MAC_LEARN_TIMEOUT = 120
-
 class TRWCBState(object):
-    """ Lưu trữ trạng thái TRW-CB cho mỗi host (theo IP nguồn). """
     def __init__(self):
-        self.success = 0
-        self.fail = 0
-        self.credits = BASE_CREDITS
+        self.credits  = BASE_CREDITS
+        self.success  = 0
+        self.fail     = 0
+        self.pending  = 0
+        # pending_flows: key = (server_ip, server_port, client_port) -> list of timestamps
+        self.pending_flows = {}
 
 class KYELearningSwitch(object):
-    """
-    POX Controller kết hợp L2 learning và TRW-CB.
-    - L2 Learning: học địa chỉ MAC để chuyển tiếp gói tin.
-    - TRW-CB: khi nhận gói TCP SYN:
-         + Nếu đích (destination port) thuộc FAKE_OPEN_PORTS => tính là success
-         + Nếu không thuộc => tính là fail.
-      Ngoài ra, nếu nhận gói TCP RST thì cũng tính là fail.
-      Sau đó, cập nhật số liệu và kiểm tra ngưỡng (fail ratio, credits) để quyết định block host.
-    """
     def __init__(self, connection, transparent=False):
         self.connection = connection
         self.transparent = transparent
 
-        # L2 table: mac -> (port, last_learn_time)
+        # MAC table for ARP/ICMP: mac -> (inport, last_time)
         self.mac_table = {}
-
-        # TRW-CB state: ip_stats[src_ip] = TRWCBState()
+        # ip_stats: client_ip -> TRWCBState (for TCP scanning state)
         self.ip_stats = defaultdict(TRWCBState)
 
         connection.addListeners(self)
@@ -72,42 +66,41 @@ class KYELearningSwitch(object):
 
         inport = event.port
 
-        # Bỏ qua LLDP
-        if packet.type == ethernet.LLDP_TYPE:
-            return
-
-        # L2 learning: học MAC của nguồn
+        # L2 learning (for ARP/ICMP)
         self._l2_learn(packet, inport)
 
-        # Nếu là ARP, flood
-        arpp = packet.find('arp')
-        if arpp:
-            self._l2_forward(event, packet)
+        # ARP: process normally (with L2 flow installation)
+        if packet.find('arp'):
+            self._l2_forward_arp_icmp(event, packet)
             return
 
-        # Nếu không phải IPv4, flood
+        # IPv4: if not TCP, forward (e.g. UDP)
         ipp = packet.find('ipv4')
         if not ipp:
             self._flood_packet(event)
             return
 
-        # Nếu là TCP, xử lý TRW-CB
         tcpp = packet.find('tcp')
         if tcpp:
             self._handle_tcp_trwcb(event, packet, ipp, tcpp)
         else:
-            # ICMP hoặc UDP => chỉ thực hiện L2 forwarding
-            self._l2_forward(event, packet)
+            self._l2_forward_arp_icmp(event, packet)
 
-    # -------------------- L2 Learning --------------------
+    # -------- L2 LEARNING & FORWARDING for non-TCP --------
     def _l2_learn(self, packet, inport):
         src_mac = packet.src
         self.mac_table[src_mac] = (inport, time.time())
+        log.debug("[MAC-LEARN] Learned MAC %s at port %d", src_mac, inport)
 
-    def _l2_forward(self, event, packet):
+    def _l2_forward_arp_icmp(self, event, packet):
+        # For non-TCP packets (ARP, ICMP), install L2 flows.
+        if packet.find('tcp'):
+            log.debug("[L2] TCP packet detected, not installing L2 flow; using flood")
+            self._flood_packet(event)
+            return
+
         dst_mac = packet.dst
         inport = event.port
-
         if dst_mac.is_multicast:
             self._flood_packet(event)
         else:
@@ -120,19 +113,6 @@ class KYELearningSwitch(object):
             else:
                 self._flood_packet(event)
 
-    def _flood_packet(self, event):
-        msg = of.ofp_packet_out()
-        msg.data = event.ofp
-        msg.in_port = event.port
-        msg.actions.append(of.ofp_action_output(port=of.OFPP_FLOOD))
-        self.connection.send(msg)
-
-    def _drop_packet(self, event):
-        msg = of.ofp_packet_out()
-        msg.data = event.ofp
-        msg.in_port = event.port
-        self.connection.send(msg)
-
     def _install_l2_flow(self, event, packet, outport):
         fm = of.ofp_flow_mod()
         fm.match = of.ofp_match.from_packet(packet, event.port)
@@ -142,105 +122,121 @@ class KYELearningSwitch(object):
         fm.actions.append(of.ofp_action_output(port=outport))
         fm.data = event.ofp
         self.connection.send(fm)
+        log.debug("[L2-FLOW] Installed L2 flow for ARP/ICMP => outport=%d", outport)
 
-    # -------------------- TRW-CB Detection --------------------
+    def _flood_packet(self, event):
+        msg = of.ofp_packet_out(data=event.ofp, in_port=event.port)
+        msg.actions.append(of.ofp_action_output(port=of.OFPP_FLOOD))
+        self.connection.send(msg)
+
+    def _drop_packet(self, event):
+        msg = of.ofp_packet_out(data=event.ofp, in_port=event.port)
+        self.connection.send(msg)
+
+    # -------- TRW-CB Processing for TCP (no L2 flows installed) --------
     def _handle_tcp_trwcb(self, event, eth_pkt, ip_pkt, tcp_pkt):
         src_ip = str(ip_pkt.srcip)
         dst_ip = str(ip_pkt.dstip)
-        dport = tcp_pkt.dstport
+        src_port = tcp_pkt.srcport
+        dst_port = tcp_pkt.dstport
 
-        # Xác định nếu là SYN không có ACK
+        # We maintain state per client (source IP)
+        st = self.ip_stats[src_ip]
+
         syn_flag = (tcp_pkt.SYN and not tcp_pkt.ACK)
-        # Nếu có flag RST, xem như thất bại
+        ack_flag = (tcp_pkt.SYN and tcp_pkt.ACK)  # SYN+ACK
         rst_flag = tcp_pkt.RST
 
-        if syn_flag:
-            if dport in FAKE_OPEN_PORTS:
-                self._trwcb_success(src_ip)
-                self._install_tcp_flow(ip_pkt.srcip, ip_pkt.dstip)
-                log.debug("[FAKE-OPEN] Host %s, port %d => success", src_ip, dport)
+        # Outbound: from local client (10.0.0.x) to server
+        if ip_pkt.srcip.inNetwork("10.0.0.0/24"):
+            # client -> server
+            if syn_flag:
+                if st.credits > 0:
+                    st.credits -= 1
+                    st.pending += 1
+                    key = (str(dst_ip), dst_port, src_port)
+                    if key not in st.pending_flows:
+                        st.pending_flows[key] = []
+                    st.pending_flows[key].append(time.time())
+                    log.debug("[TRW] %s: Outbound SYN->%s:%d, pending=%d, credit=%d, key=%s",
+                              src_ip, dst_ip, dst_port, st.pending, st.credits, key)
+                    # Schedule a check if no response arrives within PENDING_TIMEOUT
+                    core.callDelayed(PENDING_TIMEOUT, self._check_no_response, src_ip, key)
+                    # Forward the SYN (so that the server can reply)
+                    self._flood_packet(event)
+                else:
+                    st.fail += 1
+                    log.debug("[TRW] %s: No credit, dropping SYN => fail=%d, credit=%d",
+                              src_ip, st.fail, st.credits)
+                    self._drop_packet(event)
             else:
-                self._trwcb_fail(src_ip)
-                log.debug("[FAKE-CLOSED] Host %s, port %d => fail", src_ip, dport)
-            self._l2_forward(event, eth_pkt)
+                log.debug("[TRW] Outbound non-SYN TCP from %s => flood", src_ip)
+                self._flood_packet(event)
 
-        elif rst_flag:
-            # Gói RST được tính là thất bại
-            self._trwcb_fail(src_ip)
-            log.debug("[RST] Host %s, port %d => treated as fail", src_ip, dport)
-            self._l2_forward(event, eth_pkt)
+        # Inbound: from server to local client
+        elif ip_pkt.dstip.inNetwork("10.0.0.0/24"):
+            local_ip = str(ip_pkt.dstip)
+            stLocal = self.ip_stats[local_ip]
+
+            if ack_flag:
+                # inbound SYN+ACK
+                key = (str(ip_pkt.srcip), tcp_pkt.srcport, tcp_pkt.dstport)
+                if key in stLocal.pending_flows and stLocal.pending_flows[key]:
+                    stLocal.pending -= 1
+                    stLocal.success += 1
+                    stLocal.credits += SUCCESS_INC
+                    stLocal.pending_flows[key].pop(0)
+                    if not stLocal.pending_flows[key]:
+                        del stLocal.pending_flows[key]
+                    log.debug("[TRW] %s: Inbound SYN+ACK => success, pending=%d, credit=%d, success=%d, key=%s",
+                              local_ip, stLocal.pending, stLocal.credits, stLocal.success, key)
+                else:
+                    log.debug("[TRW] Inbound SYN+ACK from %s but no matching pending key: %s",
+                              local_ip, key)
+                self._flood_packet(event)
+
+            elif rst_flag:
+                # inbound RST
+                # check if it truly comes from server or from local client side
+                if not ip_pkt.srcip.inNetwork("10.0.0.0/24"):
+                    # RST from actual remote server
+                    key = (str(ip_pkt.srcip), tcp_pkt.srcport, tcp_pkt.dstport)
+                    if key in stLocal.pending_flows and stLocal.pending_flows[key]:
+                        stLocal.pending -= 1
+                        stLocal.fail += 1
+                        stLocal.credits = max(0, stLocal.credits - FAIL_DEC)
+                        stLocal.pending_flows[key].pop(0)
+                        if not stLocal.pending_flows[key]:
+                            del stLocal.pending_flows[key]
+                        log.debug("[TRW] %s: Inbound RST from server => pending=%d, credit=%d, fail=%d, key=%s",
+                                  local_ip, stLocal.pending, stLocal.credits, stLocal.fail, key)
+                    else:
+                        log.debug("[TRW] Inbound RST from server, no matching pending key: %s", key)
+                else:
+                    # RST đến từ local client => KHÔNG tính fail
+                    log.debug("[TRW] %s: Inbound RST BUT src is local => skip fail", local_ip)
+                self._flood_packet(event)
+
+            else:
+                log.debug("[TRW] Inbound non-SYN+ACK TCP from %s => flood", local_ip)
+                self._flood_packet(event)
         else:
-            # Các gói khác (ví dụ, ACK, các gói dữ liệu sau SYN+ACK) chỉ được forward
-            self._l2_forward(event, eth_pkt)
+            self._flood_packet(event)
 
-    def _install_tcp_flow(self, src_ip, dst_ip):
-        """
-        Cài đặt flow 2 chiều để giảm số lượng PacketIn từ cặp này.
-        """
-        fm = of.ofp_flow_mod()
-        fm.match.dl_type = 0x0800
-        fm.match.nw_proto = 6
-        fm.match.nw_src   = src_ip
-        fm.match.nw_dst   = dst_ip
-        fm.idle_timeout   = IDLE_TIMEOUT
-        fm.hard_timeout   = HARD_TIMEOUT
-        fm.priority       = 20
-        fm.actions.append(of.ofp_action_output(port=of.OFPP_FLOOD))
-        self.connection.send(fm)
-
-        fm2 = of.ofp_flow_mod()
-        fm2.match.dl_type = 0x0800
-        fm2.match.nw_proto = 6
-        fm2.match.nw_src   = dst_ip
-        fm2.match.nw_dst   = src_ip
-        fm2.idle_timeout   = IDLE_TIMEOUT
-        fm2.hard_timeout   = HARD_TIMEOUT
-        fm2.priority       = 20
-        fm2.actions.append(of.ofp_action_output(port=of.OFPP_FLOOD))
-        self.connection.send(fm2)
-
-    def _trwcb_success(self, host_ip):
-        st = self.ip_stats[host_ip]
-        st.success += 1
-        st.credits += SUCCESS_INC
-        log.debug("[TRW-CB] Success for %s: s=%d, credits=%d", host_ip, st.success, st.credits)
-        self._check_block(host_ip)
-
-    def _trwcb_fail(self, host_ip):
-        st = self.ip_stats[host_ip]
-        st.fail += 1
-        st.credits -= FAIL_DEC
-        log.debug("[TRW-CB] Fail for %s: f=%d, credits=%d", host_ip, st.fail, st.credits)
-        self._check_block(host_ip)
-
-    def _check_block(self, host_ip):
-        st = self.ip_stats[host_ip]
-        total = st.success + st.fail
-        fail_ratio = float(st.fail) / float(total) if total > 0 else 0.0
-        log.debug("[TRW-CB] Host %s: success=%d, fail=%d, ratio=%.2f, credits=%d",
-                  host_ip, st.success, st.fail, fail_ratio, st.credits)
-        if fail_ratio >= FAIL_RATIO_THRESHOLD or st.credits <= 0:
-            log.warn("[TRW-CB] BLOCK %s (success=%d, fail=%d, ratio=%.2f, credits=%d)",
-                     host_ip, st.success, st.fail, fail_ratio, st.credits)
-            self._push_drop_rule(host_ip)
-
-    def _push_drop_rule(self, host_ip):
-        fm = of.ofp_flow_mod()
-        fm.match.dl_type = 0x0800
-        fm.match.nw_src  = host_ip
-        fm.priority      = 100  # ưu tiên cao để drop luôn
-        # Không có actions => drop
-        fm.idle_timeout  = 300
-        fm.hard_timeout  = 600
-        self.connection.send(fm)
-        log.info("=> Drop all traffic from %s", host_ip)
+    def _check_no_response(self, src_ip, key):
+        st = self.ip_stats[src_ip]
+        if key in st.pending_flows and st.pending_flows[key]:
+            st.pending -= 1
+            st.fail += 1
+            st.credits = max(0, st.credits - FAIL_DEC)
+            st.pending_flows[key].pop(0)
+            if not st.pending_flows[key]:
+                del st.pending_flows[key]
+            log.debug("[TRW] NO-RESPONSE => fail for %s, pending=%d, credit=%d, fail=%d, key=%s",
+                      src_ip, st.pending, st.credits, st.fail, key)
 
 def launch(transparent=False):
-    """
-    Sử dụng: ./pox.py log.level --DEBUG kye_controller
-    """
     t = (str(transparent).lower() == 'true')
     from pox.core import core
-    core.openflow.addListenerByName("ConnectionUp",
-                                    lambda e: KYELearningSwitch(e.connection, t))
-    log.info("KYE + L2 + TRW-CB (FakeOpen) started.")
+    core.openflow.addListenerByName("ConnectionUp", lambda e: KYELearningSwitch(e.connection, t))
+    log.info("[KYE] TRW-CB with real port 80 (no L2 flow for TCP) started.")
