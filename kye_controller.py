@@ -38,27 +38,37 @@ class TRWCBState(object):
         self.pending_flows = {}
 
 def subnet(ip):
-    # Đơn giản cắt ip, trả về prefix /24
-    s = str(ip).split('.')
-    # s[0], s[1], s[2] -> "10","0","0",..., gộp => "10.0.0"
-    return ".".join(s[:3])  # Ví dụ "10.0.0"
+    """
+    Cắt IP '10.0.x.y' => trả về '10.0.x'
+    """
+    parts = str(ip).split('.')
+    # parts[0], parts[1], parts[2] => '10','0','x'
+    return ".".join(parts[:3])  # '10.0.x'
 
 def is_allowed_access(src_ip, dst_ip):
     """
-    Trả về True nếu được phép, False nếu bị deny
-    Access Control theo yêu cầu:
-      10.0.1.x <-> 10.0.2.x = deny
-      10.0.0.x <-> 10.0.1.x = allow
-      10.0.0.x <-> 10.0.2.x = allow
+    Ví dụ Access Control:
+      - 10.0.1.x <-> 10.0.2.x = deny
+      - 10.0.3.x <-> 10.0.4.x = deny
+      - 10.0.4.x <-> 10.0.5.x = deny
+      - Còn lại => allow
     """
-    src_sub = subnet(src_ip)   # "10.0.0"
-    dst_sub = subnet(dst_ip)   # "10.0.1" ...
-    # So sánh cặp
-    # Kiểm tra cặp (1<->2) => deny
-    if (src_sub == "10.0.1" and dst_sub == "10.0.2") \
-       or (src_sub == "10.0.2" and dst_sub == "10.0.1"):
-        return False
-    # ngược lại => allow
+    src_sub = subnet(src_ip)  # vd: '10.0.1'
+    dst_sub = subnet(dst_ip)
+
+    # Kiểm tra các cặp deny
+    deny_pairs = [
+        ("10.0.1", "10.0.2"),
+        ("10.0.3", "10.0.4"),
+        ("10.0.4", "10.0.5"),
+    ]
+
+    # Nếu (src_sub, dst_sub) hoặc (dst_sub, src_sub) nằm trong deny_pairs => False
+    for (a, b) in deny_pairs:
+        if (src_sub == a and dst_sub == b) or (src_sub == b and dst_sub == a):
+            return False
+
+    # Mặc định allow
     return True
 
 class KYELearningSwitch(object):
@@ -90,21 +100,19 @@ class KYELearningSwitch(object):
                 self._flood_packet(event)
             return
 
-        # Access Control check
+        # Access Control check for all IPv4 traffic (bao gồm ICMP)
         if not is_allowed_access(ipp.srcip, ipp.dstip):
-            # => cài flow drop
             self._install_drop_flow(event, ipp)
             log.debug("[AC] DENY from %s to %s => drop flow installed",
-                      ipp.srcip, ipp.dstip)
+                    ipp.srcip, ipp.dstip)
             return
+
+        # Nếu là TCP thì áp dụng TRW-CB, còn lại forward bình thường
+        tcpp = packet.find('tcp')
+        if tcpp:
+            self._handle_tcp_trwcb(event, packet, ipp, tcpp)
         else:
-            # => allowed => tiếp tục TRW-CB (nếu TCP), else L2
-            tcpp = packet.find('tcp')
-            if tcpp:
-                self._handle_tcp_trwcb(event, packet, ipp, tcpp)
-            else:
-                # non-TCP => forward via L2
-                self._l2_forward_arp_icmp(event, packet)
+            self._l2_forward_arp_icmp(event, packet)
 
     def _l2_learn(self, packet, inport):
         src_mac = packet.src
