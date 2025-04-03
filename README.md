@@ -31,15 +31,19 @@ python pox.py log.level --DEBUG kye_controller
 ```
 sudo mn --custom router_topo.py --topo threesubnet --controller remote --switch ovsk
 ```
-- Dump flow:
+- Dump flow or Delete Flow:
 ```
 sudo ovs-ofctl dump-flows s1
+sudo ovs-ofctl del-flows s1
 ```
 or using flow_monitor.py for easier viewing (You can use this outside of venv, using python3):
 ```
 sudo python3 flow_monitor.py
 ```
--Del flow:
+
+## Run KYE attack 
+- In host 1 (attacker), we go: 
 ```
-sudo ovs-ofctl del-flows s1
+python kye_subnet_scan.py
 ```
+Example:
